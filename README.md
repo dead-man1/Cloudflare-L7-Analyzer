@@ -64,6 +64,15 @@ build.gradle.kts → تغییر نسخه 1.5.0 → 1.6.0
 
 
 
+<img width="544" height="1136" alt="image" src="https://github.com/user-attachments/assets/17700a34-7e1d-44e2-b357-3fd176b9f6a2" />
+
+
+<img width="526" height="764" alt="image" src="https://github.com/user-attachments/assets/28dec7a8-8497-4f15-af06-646cb9284abc" />
+
+
+<img width="552" height="1129" alt="image" src="https://github.com/user-attachments/assets/1fa15908-16e1-4e1d-900c-f09c5c0396d5" />
+
+
 
 
 ---
