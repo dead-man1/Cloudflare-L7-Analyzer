@@ -7,6 +7,66 @@
 # 🚀 Advanced L7 Cloudflare Scanner & Analyzer (Android)
 ### آنالیزور و اسکنر پیشرفته لایه ۷ کلودفلر (نسخه اندروید)
 
+## ✨ Major changes (New in v1.6.0)
+
+✨ Highlights
+Domain Fronting scanner core (green theme)
+3-tier DNS fallback: UDP → System → DoH
+DNS mode selector: fallback / custom_only / system_only
+Multi-DNS support (comma / newline separated)
+IP-based VLESS link generation (DNS bypass on mobile)
+Full HTTP/2 binary frame testing (DPI detection)
+Multi-port scan: 443, 2053, 8443, 2096
+
+🔧 Improvements
+Security: fix 11 critical issues (resource leaks, bounds, validation)
+UI/UX: fix 7 issues (buttons, CONFIG tab, CSV, error handling)
+Scoring: XRAY_OK + score ≥ 60 → GREEN
+
+📁 Changes
+
+MainActivity.kt → +453 lines (Domain Fronting, DNS modes, HTTP/2, IP links)
+
+DnsResolver.kt → +277 lines (new, DNS fallback chain)
+
+XrayBridge.kt → +8 lines (xhttp transport)
+
+build.gradle.kts → 1.5.0 → 1.6.0
+
+---
+
+## 🇮🇷 توضیحات فارسی
+
+🆕 نسخه 1.6.0
+
+✨ تغییرات کلیدی
+
+هسته اسکن Domain Fronting (با تم سبز)
+DNS fallback سه‌مرحله‌ای: UDP ← System ← DoH
+انتخاب حالت DNS: fallback / custom_only / system_only
+پشتیبانی از چند DNS (جداشده با کاما یا خط جدید)
+تولید لینک VLESS مبتنی بر IP (بدون نیاز به DNS در موبایل)
+تست کامل HTTP/2 binary frame (تشخیص DPI)
+اسکن چند پورت: 443، 2053، 8443، 2096
+
+🔧 بهبودها
+
+امنیت: رفع 11 مشکل بحرانی (نشت منابع، بررسی محدوده، اعتبارسنجی)
+UI/UX: رفع 7 مشکل (دکمه‌ها، تب CONFIG، CSV، مدیریت خطا)
+امتیازدهی: XRAY_OK + امتیاز ≥ 60 → سبز
+
+
+📁 تغییرات فایل‌ها
+MainActivity.kt → ‎+453 خط (Domain Fronting، DNS modes، HTTP/2، لینک IP)
+DnsResolver.kt → ‎+277 خط (جدید، زنجیره fallback DNS)
+XrayBridge.kt → ‎+8 خط (پشتیبانی xhttp)
+build.gradle.kts → تغییر نسخه 1.5.0 → 1.6.0
+
+
+
+
+
+---
 ## ✨ Minor changes (New in v1.5.5)
 
 - Fixed host generation so empty host no longer becomes host=sni in output configs.
