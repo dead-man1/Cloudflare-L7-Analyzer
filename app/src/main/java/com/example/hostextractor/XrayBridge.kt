@@ -132,6 +132,14 @@ object XrayLiteBridge {
             stream.put("grpcSettings", JSONObject().put("serviceName", base.path.trim('/')))
         }
 
+        if (base.transport.equals("xhttp", ignoreCase = true) ||
+            base.transport.equals("splithttp", ignoreCase = true)) {
+            stream.put("xhttpSettings", JSONObject()
+                .put("host", base.host)
+                .put("path", base.path.ifBlank { "/" })
+                .put("mode", "auto"))
+        }
+
         if (base.tls) {
             val tls = JSONObject()
                 .put("serverName", base.sni.ifBlank { base.host.ifBlank { base.originalHost } })

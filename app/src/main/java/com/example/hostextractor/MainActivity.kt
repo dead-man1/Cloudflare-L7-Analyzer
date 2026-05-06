@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material3.*
@@ -64,9 +65,9 @@ import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import androidx.compose.material3.NavigationBarItemDefaults
-private const val APP_VERSION = "v1.5.6"
+private const val APP_VERSION = "v1.6.0"
 
-enum class ScannerCore { CLOUDFLARE, CLOUDFRONT }
+enum class ScannerCore { CLOUDFLARE, CLOUDFRONT, DOMAIN_FRONTING }
 enum class ResultTier { VERIFIED, STRONG, GOOD, BORDERLINE, FAILED }
 
 private const val SCAN_SERVICE_CHANNEL_ID = "scanner_fg_channel"
@@ -94,7 +95,7 @@ private const val EXTRA_CFG_ALLOW_INSECURE = "cfg_allow_insecure"
 private const val EXTRA_CFG_LABEL = "cfg_label"
 private const val EXTRA_CFG_ORIGINAL_URI = "cfg_original_uri"
 
-enum class ScanMode { CONFIG, IP }
+enum class ScanMode { CONFIG, IP, DOMAIN }
 
 data class ScanUiState(
     val running: Boolean = false,
@@ -325,12 +326,18 @@ class ScanService : Service() {
         scanJob?.cancel()
         ScanRuntime.pauseRequested = false
         ScanRuntime.rememberRequest(ScanResumeRequest(core, mode, payload, config, startIndex, resumeResults))
-        ScanRuntime.start(core, mode, if (isResume) "Resuming ${if (mode == ScanMode.CONFIG) "Config scan" else "IP scan"}" else if (mode == ScanMode.CONFIG) "Config scan" else "IP scan", resumeResults)
+        val scanLabel = when (mode) {
+            ScanMode.CONFIG -> "Config scan"
+            ScanMode.IP -> "IP scan"
+            ScanMode.DOMAIN -> "Domain fronting scan"
+        }
+        ScanRuntime.start(core, mode, if (isResume) "Resuming $scanLabel" else scanLabel, resumeResults)
         scanJob = serviceScope.launch {
             try {
                 val results = when (mode) {
                     ScanMode.CONFIG -> runConfigScan(core, payload, startIndex, resumeResults)
                     ScanMode.IP -> runIpScan(core, config, payload, startIndex, resumeResults)
+                    ScanMode.DOMAIN -> runDomainFrontingScan(core, config, payload, startIndex, resumeResults)
                 }
                 ScanRuntime.complete(results, "Completed (${results.size})")
                 notifyProgress("Completed (${results.size})", 1f, false)
@@ -435,7 +442,7 @@ class ScanService : Service() {
             fingerprint = "",
             flow = "",
             allowInsecure = false,
-            label = if (core == ScannerCore.CLOUDFRONT) "cloudfront-manual" else "cloudflare-manual"
+            label = when (core) { ScannerCore.CLOUDFRONT -> "cloudfront-manual"; ScannerCore.DOMAIN_FRONTING -> "domain-fronting-manual"; else -> "cloudflare-manual" }
         )
     }
     private suspend fun runIpScan(
@@ -469,6 +476,47 @@ class ScanService : Service() {
             output += batchResults
             index = endExclusive
             ScanRuntime.rememberRequest(ScanResumeRequest(core, ScanMode.IP, payload, config, index, output.toList()))
+            gcIfNeeded()
+        }
+
+        return output.sortedByDescending { it.confidence }.take(200)
+    }
+
+    private suspend fun runDomainFrontingScan(
+        core: ScannerCore,
+        config: ParsedTunnelConfig,
+        payload: String,
+        startIndex: Int,
+        resumeResults: List<DisplayResult>
+    ): List<DisplayResult> {
+        val candidates = extractDomainCandidates(payload)
+        if (candidates.isEmpty()) throw IllegalArgumentException("No valid domains found")
+
+        val prefs = getSharedPreferences("app_settings_domain_fronting", android.content.Context.MODE_PRIVATE)
+        val customDns = prefs.getString("customDns", "") ?: ""
+        val dnsMode = prefs.getString("dnsMode", "fallback") ?: "fallback"
+
+        val output = resumeResults.toMutableList()
+        val batchSize = minOf(200, detectBatchSize(candidates.size))
+        var index = startIndex.coerceAtLeast(0)
+
+        while (index < candidates.size) {
+            if (ScanRuntime.pauseRequested) {
+                ScanRuntime.rememberRequest(ScanResumeRequest(core, ScanMode.DOMAIN, payload, config, index, output.toList()))
+                throw PauseScanException()
+            }
+
+            val endExclusive = minOf(index + batchSize, candidates.size)
+            val batch = candidates.subList(index, endExclusive)
+            val chunkPrefix = "Domain scan ${index + 1}-${endExclusive}/${candidates.size}"
+            val batchResults = runThreeStageScan(this@ScanService, core, config, batch, chunkPrefix, customDns, dnsMode) { frac, label ->
+                val global = ((index.toFloat() / candidates.size.coerceAtLeast(1)) + (frac * (batch.size.toFloat() / candidates.size.coerceAtLeast(1)))).coerceIn(0f, 1f)
+                ScanRuntime.progress(global, label)
+                notifyProgress(label, global, false)
+            }
+            output += batchResults
+            index = endExclusive
+            ScanRuntime.rememberRequest(ScanResumeRequest(core, ScanMode.DOMAIN, payload, config, index, output.toList()))
             gcIfNeeded()
         }
 
@@ -534,6 +582,7 @@ data class CoreThemePalette(
 fun themeForCore(core: ScannerCore): CoreThemePalette = when (core) {
     ScannerCore.CLOUDFLARE -> CoreThemePalette(Color(0xFFF38020), Color(0xFF130A00), Color(0xFF221200), Color(0xFFFFB74D), Color(0xFF00C853))
     ScannerCore.CLOUDFRONT -> CoreThemePalette(Color(0xFF7C4DFF), Color(0xFF0A0E22), Color(0xFF111A33), Color(0xFFB388FF), Color(0xFF00E676))
+    ScannerCore.DOMAIN_FRONTING -> CoreThemePalette(Color(0xFF00C853), Color(0xFF001A0A), Color(0xFF002B10), Color(0xFF69F0AE), Color(0xFF00E676))
 }
 
 class SettingsManager(context: Context, profileName: String) {
@@ -547,6 +596,8 @@ class SettingsManager(context: Context, profileName: String) {
     var alpn: String get() = prefs.getString("alpn", "") ?: ""; set(v) = prefs.edit().putString("alpn", v).apply()
     var transport: String get() = prefs.getString("transport", "ws") ?: "ws"; set(v) = prefs.edit().putString("transport", v).apply()
     var flow: String get() = prefs.getString("flow", "") ?: ""; set(v) = prefs.edit().putString("flow", v).apply()
+    var customDns: String get() = prefs.getString("customDns", "") ?: ""; set(v) = prefs.edit().putString("customDns", v).apply()
+    var dnsMode: String get() = prefs.getString("dnsMode", "fallback") ?: "fallback"; set(v) = prefs.edit().putString("dnsMode", v).apply()
     var fingerprint: String get() = prefs.getString("fingerprint", "") ?: ""; set(v) = prefs.edit().putString("fingerprint", v).apply()
     var tls: Boolean get() = prefs.getBoolean("tls", true); set(v) = prefs.edit().putBoolean("tls", v).apply()
     var insecure: Boolean get() = prefs.getBoolean("insecure", false); set(v) = prefs.edit().putBoolean("insecure", v).apply()
@@ -565,7 +616,7 @@ class SettingsManager(context: Context, profileName: String) {
         fingerprint = if (tls) fingerprint else "",
         flow = flow,
         allowInsecure = if (tls) insecure else false,
-        label = if (core == ScannerCore.CLOUDFRONT) "cloudfront-manual" else "cloudflare-manual"
+        label = when (core) { ScannerCore.CLOUDFRONT -> "cloudfront-manual"; ScannerCore.DOMAIN_FRONTING -> "domain-fronting-manual"; else -> "cloudflare-manual" }
     )
 }
 
@@ -600,6 +651,7 @@ data class Stage1Probe(
 
 data class FastScanProbe(
     val ip: String,
+    val resolvedIp: String = "",  // For DOMAIN_FRONTING: DoH-resolved IP used for TCP; empty otherwise
     val bestPort: Int,
     val avgLatencyMs: Long,
     val jitterMs: Long,
@@ -678,6 +730,7 @@ fun HomeSelectionScreen(onSelect: (ScannerCore) -> Unit) {
         Text("Stage 1 foundation: initial scan → top 100 → final validation + optional Xray", color = Color.LightGray, fontSize = 13.sp)
         CoreHomeCard("Cloudflare Scanner", "Orange core for Cloudflare edge probing and validation", ScannerCore.CLOUDFLARE, onSelect)
         CoreHomeCard("CloudFront Scanner", "Blue core for stricter CloudFront validation", ScannerCore.CLOUDFRONT, onSelect)
+        CoreHomeCard("Domain Fronting Scanner", "Green core: probe CDN domains (Netlify/Vercel) — address+SNI replaced per candidate, Host header fixed from your config", ScannerCore.DOMAIN_FRONTING, onSelect)
     }
 }
 
@@ -687,9 +740,14 @@ fun CoreLogo(core: ScannerCore, modifier: Modifier = Modifier, size: Int = 24) {
     val tint = when (core) {
         ScannerCore.CLOUDFLARE -> Color(0xFFF38020)
         ScannerCore.CLOUDFRONT -> Color(0xFFB388FF)
+        ScannerCore.DOMAIN_FRONTING -> Color(0xFF69F0AE)
     }
     Icon(
-        imageVector = if (core == ScannerCore.CLOUDFLARE) Icons.Default.Cloud else Icons.Default.Public,
+        imageVector = when (core) {
+            ScannerCore.CLOUDFLARE -> Icons.Default.Cloud
+            ScannerCore.CLOUDFRONT -> Icons.Default.Public
+            ScannerCore.DOMAIN_FRONTING -> Icons.Default.Language
+        },
         contentDescription = null,
         tint = tint,
         modifier = modifier.size(size.dp)
@@ -725,13 +783,19 @@ fun ScannerWorkspace(
     val palette = themeForCore(core)
     val context = LocalContext.current
     val settings = remember(core) {
-        SettingsManager(context, if (core == ScannerCore.CLOUDFRONT) "cloudfront" else "cloudflare")
+        SettingsManager(context, when (core) {
+            ScannerCore.CLOUDFRONT -> "cloudfront"
+            ScannerCore.DOMAIN_FRONTING -> "domain_fronting"
+            else -> "cloudflare"
+        })
     }
     var selectedTab by rememberSaveable(core) { mutableIntStateOf(0) }
     var configInput by rememberSaveable(core) { mutableStateOf("") }
     var configResults by remember(core) { mutableStateOf<List<DisplayResult>>(emptyList()) }
     var ipInput by rememberSaveable(core) { mutableStateOf("") }
     var ipResults by remember(core) { mutableStateOf<List<DisplayResult>>(emptyList()) }
+    var domainInput by rememberSaveable(core) { mutableStateOf("") }
+    var domainResults by remember(core) { mutableStateOf<List<DisplayResult>>(emptyList()) }
 
     Scaffold(
         containerColor = palette.background,
@@ -794,6 +858,33 @@ fun ScannerWorkspace(
                         unselectedTextColor = Color(0xFFB8C7D9)
                     )
                 )
+
+                NavigationBarItem(
+                    selected = core == ScannerCore.DOMAIN_FRONTING,
+                    onClick = { onSwitchCore(ScannerCore.DOMAIN_FRONTING) },
+                    icon = {
+                        Icon(
+                            Icons.Default.Language,
+                            contentDescription = null,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    },
+                    label = {
+                        Text(
+                            "Domain FRT",
+                            fontSize = 11.sp,
+                            maxLines = 1
+                        )
+                    },
+                    alwaysShowLabel = true,
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Color(0xFF001A0A),
+                        selectedTextColor = Color.White,
+                        indicatorColor = Color(0xFF69F0AE),
+                        unselectedIconColor = Color(0xFFB8C7D9),
+                        unselectedTextColor = Color(0xFFB8C7D9)
+                    )
+                )
             }
         }
     ) { innerPadding ->
@@ -823,7 +914,7 @@ fun ScannerWorkspace(
                     ) {
                         CoreLogo(core = core, size = 26)
                         Text(
-                            if (core == ScannerCore.CLOUDFRONT) "CloudFront Scanner" else "Cloudflare Scanner",
+                            when (core) { ScannerCore.CLOUDFRONT -> "CloudFront Scanner"; ScannerCore.DOMAIN_FRONTING -> "Domain Fronting Scanner"; else -> "Cloudflare Scanner" },
                             color = palette.primary,
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp,
@@ -857,7 +948,7 @@ fun ScannerWorkspace(
                 containerColor = palette.surface,
                 contentColor = palette.primary
             ) {
-                listOf("INPUT", "CONFIG", "IP SCAN", "HELP").forEachIndexed { i, t ->
+                (if (core == ScannerCore.DOMAIN_FRONTING) listOf("INPUT", "DOMAIN FRT", "HELP") else listOf("INPUT", "CONFIG", "IP SCAN", "HELP")).forEachIndexed { i, t ->
                     Tab(
                         selected = selectedTab == i,
                         onClick = { selectedTab = i },
@@ -868,8 +959,14 @@ fun ScannerWorkspace(
 
             when (selectedTab) {
                 0 -> InputTab(core, settings)
-                1 -> ConfigScannerTab(core, settings, configInput, configResults, { configInput = it }, { configResults = it }, activityScope)
-                2 -> IpScannerTab(core, settings, ipInput, ipResults, { ipInput = it }, { ipResults = it }, activityScope)
+                1 -> if (core == ScannerCore.DOMAIN_FRONTING)
+                        DomainFrontingScannerTab(core, settings, domainInput, domainResults, { domainInput = it }, { domainResults = it }, activityScope)
+                     else
+                        ConfigScannerTab(core, settings, configInput, configResults, { configInput = it }, { configResults = it }, activityScope)
+                2 -> if (core == ScannerCore.DOMAIN_FRONTING)
+                        HelpTab(core)
+                     else
+                        IpScannerTab(core, settings, ipInput, ipResults, { ipInput = it }, { ipResults = it }, activityScope)
                 else -> HelpTab(core)
             }
         }
@@ -948,10 +1045,13 @@ fun InputTab(core: ScannerCore, settings: SettingsManager) {
     var fingerprint by remember { mutableStateOf(settings.fingerprint) }
     var tlsEnabled by remember { mutableStateOf(settings.tls) }
     var insecure by remember { mutableStateOf(settings.insecure) }
+    var customDns by remember { mutableStateOf(settings.customDns) }
+    var dnsMode by remember { mutableStateOf(settings.dnsMode) }
     var smartImport by remember { mutableStateOf("") }
     var alpnExpanded by remember { mutableStateOf(false) }
     var flowExpanded by remember { mutableStateOf(false) }
     var fingerprintExpanded by remember { mutableStateOf(false) }
+    var dnsModeExpanded by remember { mutableStateOf(false) }
     val alpnOptions = listOf("","http/1.1", "h2", "h3")
     val flowOptions = listOf("", "xtls-rprx-vision", "xtls-rprx-direct")
     val fingerprintOptions = listOf("","chrome", "firefox", "safari", "edge", "random")
@@ -1007,8 +1107,9 @@ fun InputTab(core: ScannerCore, settings: SettingsManager) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ToggleChip("VLESS", protocol.equals("vless", true), palette.primary) { protocol = "vless" }
             ToggleChip("TROJAN", protocol.equals("trojan", true), palette.primary) { protocol = "trojan" }
-            ToggleChip("WS", transport.equals("ws", true), palette.accent) { transport = "ws" }
-            ToggleChip("gRPC", transport.equals("grpc", true), palette.accent) { transport = "grpc" }
+            ToggleChip("WS",    transport.equals("ws",    true), palette.accent) { transport = "ws"    }
+            ToggleChip("gRPC",  transport.equals("grpc",  true), palette.accent) { transport = "grpc"  }
+            ToggleChip("xhttp", transport.equals("xhttp", true), palette.accent) { transport = "xhttp" }
         }
         OutlinedTextField(
             value = host,
@@ -1146,6 +1247,85 @@ fun InputTab(core: ScannerCore, settings: SettingsManager) {
         }
         Row(verticalAlignment = Alignment.CenterVertically) { Text("TLS", color = Color.White, modifier = Modifier.weight(1f)); Switch(checked = tlsEnabled, onCheckedChange = { tlsEnabled = it }) }
         Row(verticalAlignment = Alignment.CenterVertically) { Text("Allow insecure", color = Color.White, modifier = Modifier.weight(1f)); Switch(checked = insecure, onCheckedChange = { insecure = it }) }
+        if (core == ScannerCore.DOMAIN_FRONTING) {
+            Text("DNS Configuration", color = palette.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+
+            // DNS mode selector
+            ExposedDropdownMenuBox(
+                expanded = dnsModeExpanded,
+                onExpandedChange = { dnsModeExpanded = !dnsModeExpanded },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedTextField(
+                    value = when (dnsMode) {
+                        "fallback" -> "Smart Fallback (Custom → System → DoH)"
+                        "custom_only" -> "Custom DNS Only (No Fallback)"
+                        "system_only" -> "System DNS Only (Realistic Test)"
+                        else -> "Smart Fallback"
+                    },
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("DNS Resolution Mode") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = dnsModeExpanded) },
+                    modifier = Modifier.menuAnchor().fillMaxWidth(),
+                    textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 14.sp),
+                    colors = inputColors
+                )
+                ExposedDropdownMenu(
+                    expanded = dnsModeExpanded,
+                    onDismissRequest = { dnsModeExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text("Smart Fallback (Recommended)")
+                                Text("Custom → System → DoH", fontSize = 11.sp, color = Color.Gray)
+                            }
+                        },
+                        onClick = { dnsMode = "fallback"; dnsModeExpanded = false }
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text("Custom DNS Only")
+                                Text("No fallback - strict test", fontSize = 11.sp, color = Color.Gray)
+                            }
+                        },
+                        onClick = { dnsMode = "custom_only"; dnsModeExpanded = false }
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text("System DNS Only")
+                                Text("Realistic phone test", fontSize = 11.sp, color = Color.Gray)
+                            }
+                        },
+                        onClick = { dnsMode = "system_only"; dnsModeExpanded = false }
+                    )
+                }
+            }
+
+            // Multi-line DNS input
+            val dnsServers = customDns.split(',', '\n').map { it.trim() }.filter { it.isNotBlank() }
+            val allDnsValid = dnsServers.isEmpty() || dnsServers.all { it.matches(Regex("^(\\d{1,3}\\.){3}\\d{1,3}$")) }
+
+            OutlinedTextField(
+                value = customDns,
+                onValueChange = { customDns = it },
+                label = { Text("Custom DNS Servers (comma or line-separated)") },
+                placeholder = { Text("e.g. 8.8.8.8, 1.1.1.1 or one per line", color = Color.Gray) },
+                isError = !allDnsValid,
+                supportingText = if (!allDnsValid) {
+                    { Text("One or more invalid IP formats", color = Color.Red) }
+                } else if (dnsServers.isNotEmpty()) {
+                    { Text("${dnsServers.size} DNS server(s) configured", color = Color(0xFF00C853)) }
+                } else null,
+                modifier = Modifier.fillMaxWidth(),
+                maxLines = 4,
+                textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 14.sp, lineHeight = 20.sp),
+                colors = inputColors
+            )
+        }
         Button(onClick = {
             settings.protocol = protocol
             settings.host = host.trim()
@@ -1159,7 +1339,11 @@ fun InputTab(core: ScannerCore, settings: SettingsManager) {
             settings.fingerprint = if (tlsEnabled) fingerprint.trim() else ""
             settings.tls = tlsEnabled
             settings.insecure = if (tlsEnabled) insecure else false
-            Toast.makeText(context, "Saved for ${if (core == ScannerCore.CLOUDFRONT) "CloudFront" else "Cloudflare"}", Toast.LENGTH_SHORT).show()
+            if (core == ScannerCore.DOMAIN_FRONTING) {
+                settings.customDns = customDns.trim()
+                settings.dnsMode = dnsMode
+            }
+            Toast.makeText(context, "Saved for ${when(core) { ScannerCore.CLOUDFRONT -> "CloudFront"; ScannerCore.DOMAIN_FRONTING -> "Domain Fronting"; else -> "Cloudflare" }}", Toast.LENGTH_SHORT).show()
         }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = palette.primary, contentColor = Color.Black)) { Text("SAVE INPUT") }
         Button(onClick = {
             settings.clearAll()
@@ -1175,6 +1359,7 @@ fun InputTab(core: ScannerCore, settings: SettingsManager) {
             fingerprint = ""
             tlsEnabled = true
             insecure = false
+            customDns = ""
             smartImport = ""
         }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E2424))) { Text("RESET INPUT") }
     }
@@ -1273,10 +1458,10 @@ fun ConfigScannerTab(core: ScannerCore, settings: SettingsManager, input: String
                     containerColor = if (canResume) Color(0xFF1565C0) else palette.primary,
                     contentColor = if (canResume) Color.White else Color.Black
                 ),
-                modifier = Modifier.weight(1f).height(64.dp),
-                shape = RoundedCornerShape(28.dp)
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text(if (canResume) "RESUME" else "START", fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false)
+                Text(if (canResume) "RESUME" else "START", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             }
 
             Button(
@@ -1285,10 +1470,10 @@ fun ConfigScannerTab(core: ScannerCore, settings: SettingsManager, input: String
                     context.startService(Intent(context, ScanService::class.java).setAction(action))
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E2424)),
-                modifier = Modifier.weight(1f).height(64.dp),
-                shape = RoundedCornerShape(28.dp)
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text(if (isTesting) "PAUSE" else "STOP", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(if (isTesting) "PAUSE" else "STOP", fontSize = 13.sp, fontWeight = FontWeight.Bold)
             }
 
             Button(
@@ -1297,10 +1482,10 @@ fun ConfigScannerTab(core: ScannerCore, settings: SettingsManager, input: String
                     Toast.makeText(context, "Copied all rebuilt configs", Toast.LENGTH_SHORT).show()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
-                modifier = Modifier.weight(1f).height(64.dp),
-                shape = RoundedCornerShape(28.dp)
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text("COPY ALL", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 2)
+                Text("COPY", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             }
         }
         results.forEach { ResultRow(it, core) }
@@ -1344,28 +1529,30 @@ fun IpScannerTab(core: ScannerCore, settings: SettingsManager, input: String, re
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             Button(
                 onClick = { onInputChange((if (core == ScannerCore.CLOUDFRONT) CLOUDFRONT_SAMPLE_RANGES else CLOUDFLARE_RANGES).joinToString("\n")) },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF12314C), contentColor = Color.White),
-                shape = RoundedCornerShape(20.dp)
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f)
             ) {
                 Text(
-                    if (core == ScannerCore.CLOUDFRONT) "LOAD SAMPLE CFN RANGES" else "LOAD DEFAULT CF RANGES",
+                    if (core == ScannerCore.CLOUDFRONT) "SAMPLE CFN" else "DEFAULT CF",
                     fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp,
+                    fontSize = 12.sp,
                     maxLines = 1
                 )
             }
             Button(
                 onClick = { filePicker.launch(arrayOf("text/*", "application/json", "application/octet-stream", "*/*")) },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF12314C), contentColor = Color.White),
-                shape = RoundedCornerShape(20.dp)
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.weight(1f)
             ) {
                 Text(
-                    "LOAD FILE",
+                    "+ FILE",
                     fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp,
+                    fontSize = 12.sp,
                     maxLines = 1
                 )
             }
@@ -1435,10 +1622,10 @@ fun IpScannerTab(core: ScannerCore, settings: SettingsManager, input: String, re
                     containerColor = if (canResume) Color(0xFF1565C0) else palette.primary,
                     contentColor = if (canResume) Color.White else Color.Black
                 ),
-                modifier = Modifier.weight(1f).height(64.dp),
-                shape = RoundedCornerShape(28.dp)
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text(if (canResume) "RESUME" else "START", fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false)
+                Text(if (canResume) "RESUME" else "START", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             }
 
             Button(
@@ -1447,10 +1634,10 @@ fun IpScannerTab(core: ScannerCore, settings: SettingsManager, input: String, re
                     context.startService(Intent(context, ScanService::class.java).setAction(action))
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E2424)),
-                modifier = Modifier.weight(1f).height(64.dp),
-                shape = RoundedCornerShape(28.dp)
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text(if (isTesting) "PAUSE" else "STOP", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(if (isTesting) "PAUSE" else "STOP", fontSize = 13.sp, fontWeight = FontWeight.Bold)
             }
 
             Button(
@@ -1459,10 +1646,178 @@ fun IpScannerTab(core: ScannerCore, settings: SettingsManager, input: String, re
                     Toast.makeText(context, "Copied verified configs", Toast.LENGTH_SHORT).show()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
-                modifier = Modifier.weight(1f).height(64.dp),
-                shape = RoundedCornerShape(28.dp)
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text("COPY ALL", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 2)
+                Text("COPY", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            }
+        }
+        results.forEach { ResultRow(it, core) }
+    }
+}
+
+@Composable
+fun DomainFrontingScannerTab(
+    core: ScannerCore,
+    settings: SettingsManager,
+    input: String,
+    results: List<DisplayResult>,
+    onInputChange: (String) -> Unit,
+    onResultsChange: (List<DisplayResult>) -> Unit,
+    activityScope: CoroutineScope
+) {
+    val palette = themeForCore(core)
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        val loadedText = runCatching { readTextFromUri(context, uri) }.getOrDefault("")
+        if (loadedText.isBlank()) {
+            Toast.makeText(context, "Selected file is empty", Toast.LENGTH_SHORT).show()
+            return@rememberLauncherForActivityResult
+        }
+        val domains = extractDomainCandidates(loadedText)
+        onInputChange(if (domains.isNotEmpty()) domains.joinToString("\n") else loadedText)
+        Toast.makeText(context, "Loaded ${domains.size} domains", Toast.LENGTH_SHORT).show()
+    }
+    val scanState by ScanRuntime.state.collectAsState()
+    val isTesting = scanState.running && scanState.mode == ScanMode.DOMAIN && scanState.core == core
+    val isPaused = scanState.paused && scanState.mode == ScanMode.DOMAIN && scanState.core == core
+    val canResume = scanState.resumeAvailable && scanState.mode == ScanMode.DOMAIN && scanState.core == core
+    val progress = if (scanState.mode == ScanMode.DOMAIN && scanState.core == core) scanState.progress else 0f
+    val progressLabel = if (scanState.mode == ScanMode.DOMAIN && scanState.core == core) scanState.progressLabel else "Idle"
+    LaunchedEffect(scanState.results, scanState.mode, scanState.core) {
+        if (scanState.mode == ScanMode.DOMAIN && scanState.core == core) {
+            onResultsChange(scanState.results)
+        }
+    }
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Button(
+            onClick = { filePicker.launch(arrayOf("text/*", "*/*")) },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0D3320), contentColor = Color.White),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("+ ADD DOMAINS FILE", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        }
+
+        Box {
+            OutlinedTextField(
+                value = input,
+                onValueChange = onInputChange,
+                label = { Text("Domains to test (one per line)") },
+                modifier = Modifier.fillMaxWidth().height(170.dp),
+                textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 16.sp, lineHeight = 22.sp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    focusedLabelColor = palette.accent,
+                    unfocusedLabelColor = Color(0xFFD6E4F0),
+                    cursorColor = palette.primary,
+                    focusedBorderColor = Color(0xFF69F0AE),
+                    unfocusedBorderColor = Color(0xFF4CAF50),
+                    focusedContainerColor = Color(0xFF0A1A0E),
+                    unfocusedContainerColor = Color(0xFF0A1A0E)
+                )
+            )
+            Row(Modifier.align(Alignment.TopEnd).padding(4.dp)) {
+                IconButton(onClick = { clipboard.getText()?.let { onInputChange(it.text) } }) {
+                    Icon(Icons.Default.ContentPaste, null, tint = palette.primary)
+                }
+                IconButton(onClick = { onInputChange("") }) {
+                    Icon(Icons.Default.Delete, null, tint = Color.Red)
+                }
+            }
+        }
+
+        if (isTesting || isPaused) {
+            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth(), color = palette.primary)
+            Text(progressLabel, color = Color.White, fontSize = 12.sp)
+        }
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                onClick = {
+                    if (canResume) {
+                        val resumeIntent = buildResumeScanServiceIntent(context)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(resumeIntent) else context.startService(resumeIntent)
+                    } else {
+                        val baseConfig = settings.toParsedConfig(core)
+
+                        // Critical validation: Domain Fronting requires host field (CDN routing subdomain)
+                        if (baseConfig.host.isBlank()) {
+                            Toast.makeText(context, "ERROR: Go to INPUT tab and paste your VLESS config first! Host field is required for Domain Fronting.", Toast.LENGTH_LONG).show()
+                            return@Button
+                        }
+
+                        val rawLines = input.lines().filter { it.isNotBlank() && !it.trim().startsWith("#") }
+                        val domains = extractDomainCandidates(input)
+
+                        if (rawLines.isEmpty()) {
+                            Toast.makeText(context, "Please enter domains (one per line)", Toast.LENGTH_LONG).show()
+                            return@Button
+                        }
+
+                        if (domains.isEmpty()) {
+                            Toast.makeText(context, "No valid domains found. Format: example.com or example.com | A_RECORD | IP", Toast.LENGTH_LONG).show()
+                            return@Button
+                        }
+
+                        val filtered = rawLines.size - domains.size
+                        if (filtered > 0) {
+                            Toast.makeText(context, "Filtered $filtered invalid entries. Scanning ${domains.size} valid domains.", Toast.LENGTH_SHORT).show()
+                        }
+
+                        onResultsChange(emptyList())
+                        val serviceIntent = buildScanServiceIntent(
+                            context = context,
+                            core = core,
+                            mode = ScanMode.DOMAIN,
+                            payload = input,
+                            config = baseConfig
+                        )
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(serviceIntent) else context.startService(serviceIntent)
+                    }
+                },
+                enabled = !isTesting || canResume,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (canResume) Color(0xFF1565C0) else palette.primary,
+                    contentColor = if (canResume) Color.White else Color.Black
+                ),
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(if (canResume) "RESUME" else "START", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            }
+
+            Button(
+                onClick = {
+                    val action = if (isTesting) ACTION_PAUSE_SCAN else ACTION_STOP_SCAN
+                    context.startService(Intent(context, ScanService::class.java).setAction(action))
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E2424)),
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(if (isTesting) "PAUSE" else "STOP", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Button(
+                onClick = {
+                    clipboard.setText(AnnotatedString(results.joinToString("\n") { it.builtConfig }))
+                    Toast.makeText(context, "Copied verified configs", Toast.LENGTH_SHORT).show()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text("COPY", fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             }
         }
         results.forEach { ResultRow(it, core) }
@@ -1619,8 +1974,11 @@ fun ResultRow(result: DisplayResult, core: ScannerCore) {
 private fun resultVerdictLabel(result: DisplayResult): String = when {
     result.status.equals("READY", true) -> "READY"
     result.status.equals("MAYBE", true) -> "MAYBE"
-    result.tier == ResultTier.VERIFIED || result.confidence >= 85 -> "READY"
-    result.confidence >= 55 || result.xrayStatus.startsWith("XRAY_OK") -> "MAYBE"
+    // READY: High confidence OR verified OR xray passed with good score
+    result.tier == ResultTier.VERIFIED || result.confidence >= 80 -> "READY"
+    result.xrayStatus.startsWith("XRAY_OK") && result.confidence >= 60 -> "READY"
+    // MAYBE: Medium confidence OR xray passed with lower score
+    result.confidence >= 50 || result.xrayStatus.startsWith("XRAY_OK") -> "MAYBE"
     else -> "FAILED"
 }
 
@@ -1673,11 +2031,11 @@ private suspend fun runSpeedRetest(result: DisplayResult): String = withContext(
     "Speed Test | avg=${avg}ms | jitter=${jitter}ms | success=${attempts.size}/3 | $status"
 }
 
-suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: ParsedTunnelConfig, candidates: List<String>, progressPrefix: String, onProgress: (Float, String) -> Unit): List<DisplayResult> = coroutineScope {
+suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: ParsedTunnelConfig, candidates: List<String>, progressPrefix: String, customDns: String = "", dnsMode: String = "fallback", onProgress: (Float, String) -> Unit): List<DisplayResult> = coroutineScope {
     val uniqueCandidates = candidates.filter { it.isNotBlank() }.distinct()
     if (uniqueCandidates.isEmpty()) return@coroutineScope emptyList()
 
-    val fastResults = runFastScanStage(baseConfig, uniqueCandidates, core, progressPrefix, onProgress)
+    val fastResults = runFastScanStage(baseConfig, uniqueCandidates, core, progressPrefix, customDns, dnsMode, onProgress)
     val top100 = selectTopFastCandidates(fastResults, 100)
     ScannerLog.scan("top100 selected count=${top100.size} from total=${fastResults.size}")
 
@@ -1685,7 +2043,13 @@ suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: P
         return@coroutineScope fastResults.take(20).map {
             DisplayResult(
                 it.ip,
-                buildUri(baseConfig.copy(originalHost = it.ip, port = it.bestPort), it.ip, "FAST_FAILED"),
+                buildUri(
+                    if (core == ScannerCore.DOMAIN_FRONTING) baseConfig.copy(originalHost = it.ip, sni = it.ip, port = it.bestPort)
+                    else baseConfig.copy(originalHost = it.ip, port = it.bestPort),
+                    it.ip,
+                    "FAST_FAILED",
+                    it.resolvedIp  // Pass resolved IP for Domain Fronting
+                ),
                 it.avgLatencyMs,
                 0,
                 0,
@@ -1700,13 +2064,19 @@ suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: P
     }
 
     val finals = mutableListOf<DisplayResult>()
-    val finalSemaphore = Semaphore(if (core == ScannerCore.CLOUDFRONT) 8 else 12)
+    val finalSemaphore = Semaphore(when (core) { ScannerCore.CLOUDFRONT, ScannerCore.DOMAIN_FRONTING -> 8; else -> 12 })
     var finalDone = 0
 
     top100.map { probe ->
         async(Dispatchers.IO) {
             finalSemaphore.withPermit {
-                val validationBase = baseConfig.copy(originalHost = probe.ip, port = probe.bestPort)
+                val tcpTarget = if (core == ScannerCore.DOMAIN_FRONTING)
+                    probe.resolvedIp.ifBlank { probe.ip }
+                else probe.ip
+                val validationBase = if (core == ScannerCore.DOMAIN_FRONTING)
+                    baseConfig.copy(originalHost = tcpTarget, sni = probe.ip, port = probe.bestPort)
+                else
+                    baseConfig.copy(originalHost = probe.ip, port = probe.bestPort)
                 val validation = performFinalValidation(context, validationBase, probe.ip, core)
                 val tier = tierForConfidence(validation.confidence)
                 val status = when {
@@ -1719,7 +2089,7 @@ suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: P
                     finals.add(
                         DisplayResult(
                             probe.ip,
-                            buildUri(validationBase, probe.ip, status),
+                            buildUri(validationBase, probe.ip, status, probe.resolvedIp),
                             probe.avgLatencyMs,
                             validation.latencyMs,
                             validation.aliveMs,
@@ -1748,7 +2118,7 @@ private fun detectFastScanParallelism(core: ScannerCore, totalCandidates: Int): 
     val maxMb = runtime.maxMemory() / (1024 * 1024)
     val usedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
     val freeHeadroomMb = (maxMb - usedMb).coerceAtLeast(32)
-    val base = if (core == ScannerCore.CLOUDFRONT) 56 else 88
+    val base = when (core) { ScannerCore.CLOUDFRONT -> 56; ScannerCore.DOMAIN_FRONTING -> 40; else -> 88 }
     val memoryCap = when {
         freeHeadroomMb < 96 -> 16
         freeHeadroomMb < 160 -> 24
@@ -1803,7 +2173,7 @@ private fun selectTopFastCandidates(results: List<FastScanProbe>, limit: Int = 1
         )
         .take(limit)
 
-private suspend fun runFastScanStage(baseConfig: ParsedTunnelConfig, uniqueCandidates: List<String>, core: ScannerCore, progressPrefix: String, onProgress: (Float, String) -> Unit): List<FastScanProbe> = coroutineScope {
+private suspend fun runFastScanStage(baseConfig: ParsedTunnelConfig, uniqueCandidates: List<String>, core: ScannerCore, progressPrefix: String, customDns: String = "", dnsMode: String = "fallback", onProgress: (Float, String) -> Unit): List<FastScanProbe> = coroutineScope {
     val fastResults = mutableListOf<FastScanProbe>()
     val semaphore = Semaphore(detectFastScanParallelism(core, uniqueCandidates.size))
     val total = uniqueCandidates.size
@@ -1812,7 +2182,7 @@ private suspend fun runFastScanStage(baseConfig: ParsedTunnelConfig, uniqueCandi
     uniqueCandidates.map { ip ->
         async(Dispatchers.IO) {
             semaphore.withPermit {
-                val probe = performFastScanProbe(baseConfig, ip)
+                val probe = performFastScanProbe(baseConfig, ip, core, customDns, dnsMode)
                 synchronized(fastResults) { fastResults.add(probe) }
                 completed += 1
                 onProgress((completed.toFloat() / total.coerceAtLeast(1)) * 0.45f, "$progressPrefix • fast $completed/$total")
@@ -1822,15 +2192,48 @@ private suspend fun runFastScanStage(baseConfig: ParsedTunnelConfig, uniqueCandi
     fastResults
 }
 
-private fun performFastScanProbe(baseConfig: ParsedTunnelConfig, ip: String): FastScanProbe {
-    val portsToTest = candidatePortsForFastScan(baseConfig.port)
+private fun performFastScanProbe(baseConfig: ParsedTunnelConfig, ip: String, core: ScannerCore = ScannerCore.CLOUDFLARE, customDns: String = "", dnsMode: String = "fallback"): FastScanProbe {
+    // For domain fronting: resolve domain → IP via fallback chain to bypass DNS poisoning
+    val resolvedIp = if (core == ScannerCore.DOMAIN_FRONTING) {
+        try {
+            val resolved = DnsResolver.resolveBlocking(ip, customDns, dnsMode)
+            // If all DNS methods fail, don't waste time on TCP probe — skip this domain
+            if (resolved == null) {
+                ScannerLog.scan("dns SKIP domain=$ip (unresolvable)")
+                return FastScanProbe(
+                    ip = ip,
+                    resolvedIp = "",
+                    bestPort = baseConfig.port,
+                    avgLatencyMs = -1,
+                    jitterMs = 0,
+                    successCount = 0,
+                    attempts = 1,
+                    bytesReceived = 0,
+                    score = 0,
+                    status = "DNS_FAILED",
+                    sampleStage = "DNS_FAILED",
+                    alpnMismatch = false,
+                    error = "DNS resolution failed (all methods)"
+                )
+            }
+            resolved
+        } catch (e: Throwable) {
+            ScannerLog.scan("dns EXCEPTION domain=$ip error=${e.message}")
+            ip  // Fallback to domain (let Socket try system DNS as last resort)
+        }
+    } else ip
+
+    val portsToTest = candidatePortsForFastScan(baseConfig.port)  // Test multiple ports for all cores
     val quickTimeoutMs = 6000
     val quickKeepAliveMs = 450L
     val portResults = mutableListOf<Pair<Int, Stage1Probe>>()
     var alpnMismatch = false
 
     for (port in portsToTest) {
-        val probeConfig = baseConfig.copy(originalHost = ip, port = port)
+        val probeConfig = if (core == ScannerCore.DOMAIN_FRONTING)
+            baseConfig.copy(originalHost = resolvedIp, sni = ip, port = port)  // TCP → resolved IP, TLS SNI → domain
+        else
+            baseConfig.copy(originalHost = ip, port = port)
         ScannerLog.scan("before fastProbe ip=$ip port=$port host=${probeConfig.host} sni=${probeConfig.sni} transport=${probeConfig.transport} tls=${probeConfig.tls}")
         val probe = performStage1Probe(probeConfig, quickTimeoutMs, quickKeepAliveMs)
         ScannerLog.scan("after fastProbe ip=$ip port=$port latency=${probe.latencyMs}ms success=${probe.success} stage=${probe.stage} bytes=${probe.bytesReceived} alive=${probe.aliveMs} err=${probe.error}")
@@ -1842,6 +2245,7 @@ private fun performFastScanProbe(baseConfig: ParsedTunnelConfig, ip: String): Fa
     if (successfulPorts.isEmpty()) {
         return FastScanProbe(
             ip = ip,
+            resolvedIp = if (core == ScannerCore.DOMAIN_FRONTING) resolvedIp else "",
             bestPort = baseConfig.port,
             avgLatencyMs = -1,
             jitterMs = 0,
@@ -1860,7 +2264,11 @@ private fun performFastScanProbe(baseConfig: ParsedTunnelConfig, ip: String): Fa
     val bestPort = best.first
     val attempts = mutableListOf(best.second)
     repeat(2) {
-        val retry = performStage1Probe(baseConfig.copy(originalHost = ip, port = bestPort), 4500, 450L)
+        val retryConfig = if (core == ScannerCore.DOMAIN_FRONTING)
+            baseConfig.copy(originalHost = resolvedIp, sni = ip, port = bestPort)
+        else
+            baseConfig.copy(originalHost = ip, port = bestPort)
+        val retry = performStage1Probe(retryConfig, 4500, 450L)
         if (retry.success) attempts += retry
     }
     val latencies = attempts.map { it.latencyMs }.filter { it > 0 }
@@ -1877,6 +2285,7 @@ private fun performFastScanProbe(baseConfig: ParsedTunnelConfig, ip: String): Fa
 
     return FastScanProbe(
         ip = ip,
+        resolvedIp = if (core == ScannerCore.DOMAIN_FRONTING) resolvedIp else "",
         bestPort = bestPort,
         avgLatencyMs = avgLatency,
         jitterMs = jitter,
@@ -1954,6 +2363,35 @@ private fun expandCandidateText(raw: String): List<String> {
 
 private fun isProbablyIp(value: String): Boolean = Regex("""^(\d{1,3}\.){3}\d{1,3}$""").matches(value)
 
+private fun extractDomainCandidates(raw: String): List<String> {
+    val domainRegex = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+    return raw.lineSequence()
+        .map { line ->
+            // Support CSV format: "domain.com | A_RECORD | IP" → extract first part
+            val cleaned = line.trim().lowercase()
+            if (cleaned.contains('|')) {
+                cleaned.substringBefore('|').trim()
+            } else {
+                cleaned
+            }
+        }
+        .filter { it.isNotBlank() && !it.startsWith("#") }
+        .filter { it.contains('.') && !isProbablyIp(it) }
+        .filter { domain ->
+            // Strict validation: valid domain format + length checks
+            domain.length in 4..253 &&
+            !domain.contains("..") &&
+            !domain.startsWith(".") &&
+            !domain.endsWith(".") &&
+            !domain.contains(' ') &&
+            !domain.contains('/') &&
+            domainRegex.matches(domain) &&
+            domain.split(".").all { it.length <= 63 }  // Each label max 63 chars
+        }
+        .distinct()
+        .toList()
+}
+
 private fun generateIpsFromCidr(cidr: String): List<String> = try {
     val parts = cidr.split("/")
     val base = parts[0]
@@ -1983,8 +2421,8 @@ private suspend fun performFinalValidation(context: Context, baseConfig: ParsedT
 
     val finalProbe = performStage1Probe(
         finalConfig,
-        if (core == ScannerCore.CLOUDFRONT) 12000 else 10000,
-        if (core == ScannerCore.CLOUDFRONT) 5000 else 3500
+        if (core == ScannerCore.CLOUDFRONT || core == ScannerCore.DOMAIN_FRONTING) 12000 else 10000,
+        if (core == ScannerCore.CLOUDFRONT || core == ScannerCore.DOMAIN_FRONTING) 5000 else 3500
     )
 
     ScannerLog.scan(
@@ -2017,7 +2455,7 @@ private suspend fun performFinalValidation(context: Context, baseConfig: ParsedT
     if (finalProbe.bytesReceived > 16) score += 10
     if (finalProbe.latencyMs in 1..1000) score += (20 - (finalProbe.latencyMs / 60).toInt()).coerceAtLeast(2)
     if (xrayResult.success) score += 20
-    if (core == ScannerCore.CLOUDFRONT && finalProbe.aliveMs < 2500) score -= 10
+    if ((core == ScannerCore.CLOUDFRONT || core == ScannerCore.DOMAIN_FRONTING) && finalProbe.aliveMs < 2500) score -= 10
     if (!finalProbe.success) score = 0
     score = score.coerceIn(0, 100)
 
@@ -2040,6 +2478,10 @@ private suspend fun performFinalValidation(context: Context, baseConfig: ParsedT
 }
 
 private fun performStage1Probe(config: ParsedTunnelConfig, stageTimeoutMs: Int, keepAliveMs: Long = 1200): Stage1Probe {
+    val isXhttp = config.transport.equals("xhttp", ignoreCase = true) ||
+                  config.transport.equals("splithttp", ignoreCase = true)
+    val isGrpc  = config.transport.equals("grpc", ignoreCase = true)
+
     val socket = Socket(); val start = System.currentTimeMillis()
     return try {
         socket.soTimeout = stageTimeoutMs
@@ -2055,16 +2497,186 @@ private fun performStage1Probe(config: ParsedTunnelConfig, stageTimeoutMs: Int, 
         } else {
             Quad(BufferedInputStream(socket.getInputStream()), socket.getOutputStream(), "", socket as AutoCloseable)
         }
-        quad.second.write(buildWebSocketHandshake(config).toByteArray()); quad.second.flush()
-        val headerBytes = readHttpHeader(quad.first, stageTimeoutMs)
-        val headerText = headerBytes.toString(Charsets.UTF_8)
-        if (!headerText.startsWith("HTTP/1.1 101") && !headerText.startsWith("HTTP/1.0 101")) { quad.fourth.close(); return Stage1Probe(config.originalHost, false, -1, "WS_REJECTED", headerBytes.size, System.currentTimeMillis() - start, false, headerText.lineSequence().firstOrNull() ?: "No 101") }
-        val pingFrame = byteArrayOf(0x89.toByte(), 0x80.toByte(), 0x11, 0x22, 0x33, 0x44)
-        quad.second.write(pingFrame); quad.second.flush()
-        var extraBytes = 0; val waitUntil = System.currentTimeMillis() + keepAliveMs
-        while (System.currentTimeMillis() < waitUntil) { if (quad.first.available() > 0) extraBytes += quad.first.readNBytes(minOf(quad.first.available(), 1024)).size; delayBlocking(80) }
-        quad.fourth.close(); Stage1Probe(config.originalHost, true, System.currentTimeMillis() - start, if (quad.third.isNotBlank()) "WS_OK/${quad.third}" else "WS_OK", headerBytes.size + extraBytes, keepAliveMs)
+
+        when {
+            isGrpc -> {
+                // gRPC: TLS + ALPN h2 negotiation is sufficient for Stage 1
+                val latency = System.currentTimeMillis() - start
+                quad.fourth.close()
+                Stage1Probe(config.originalHost, true, latency,
+                    if (quad.third.isNotBlank()) "GRPC_TLS_OK/${quad.third}" else "GRPC_TLS_OK",
+                    0, latency)
+            }
+            isXhttp -> {
+                val negotiatedProto = quad.third.lowercase()
+                ScannerLog.scan("xhttp negotiated ALPN: $negotiatedProto")
+
+                // HTTP/2 requires binary frames - send minimal GET request
+                if (negotiatedProto == "h2") {
+                    try {
+                        val h2Probe = buildHttp2Probe(config)
+                        quad.second.write(h2Probe)
+                        quad.second.flush()
+
+                        // Read HTTP/2 response frames (first few frames should arrive quickly)
+                        val responseBytes = ByteArray(1024)
+                        val bytesRead = try {
+                            quad.first.read(responseBytes, 0, responseBytes.size)
+                        } catch (e: Exception) {
+                            0
+                        }
+
+                        val latency = System.currentTimeMillis() - start
+                        quad.fourth.close()
+
+                        if (bytesRead > 0) {
+                            val hexDump = responseBytes.take(50).joinToString(" ") { String.format("%02X", it) }
+                            ScannerLog.scan("xhttp h2 response: $bytesRead bytes, hex=$hexDump")
+                            return Stage1Probe(config.originalHost, true, latency, "XHTTP_OK/h2",
+                                bytesRead, latency)
+                        } else {
+                            ScannerLog.scan("xhttp h2 no response")
+                            return Stage1Probe(config.originalHost, false, -1, "XHTTP_REJECTED",
+                                0, System.currentTimeMillis() - start, false, "HTTP/2 no response")
+                        }
+                    } catch (e: Exception) {
+                        quad.fourth.close()
+                        ScannerLog.scan("xhttp h2 exception: ${e.message}")
+                        return Stage1Probe(config.originalHost, false, -1, "XHTTP_REJECTED",
+                            0, System.currentTimeMillis() - start, false, "HTTP/2 error: ${e.message}")
+                    }
+                }
+
+                // HTTP/3 not supported - treat as success (TLS worked)
+                if (negotiatedProto == "h3") {
+                    val latency = System.currentTimeMillis() - start
+                    quad.fourth.close()
+                    ScannerLog.scan("xhttp using h3 - not implemented, TLS success")
+                    return Stage1Probe(config.originalHost, true, latency, "XHTTP_TLS_OK/h3", 0, latency)
+                }
+
+                // HTTP/1.1 - send text probe
+                quad.second.write(buildXhttpProbe(config).toByteArray()); quad.second.flush()
+                val headerBytes = readHttpHeader(quad.first, stageTimeoutMs)
+                val headerText  = headerBytes.toString(Charsets.UTF_8)
+                val statusLine  = headerText.lineSequence().firstOrNull() ?: ""
+                val statusCode  = statusLine.split(" ").getOrNull(1)?.toIntOrNull() ?: 0
+
+                // Log full response for debugging
+                val hexDump = headerBytes.take(50).joinToString(" ") { String.format("%02X", it) }
+                ScannerLog.scan("xhttp response: ${headerBytes.size} bytes, status=$statusCode, hex=$hexDump")
+                ScannerLog.scan("xhttp response text: $statusLine")
+
+                // Any 1xx-4xx means L7 reached (CDN responded); 5xx or no response = rejected
+                if (statusCode == 0 || statusCode >= 500) {
+                    quad.fourth.close()
+                    val cleanError = statusLine.take(100).filter { it.code in 32..126 }.ifBlank { "Binary/Invalid HTTP response" }
+                    return Stage1Probe(config.originalHost, false, -1, "XHTTP_REJECTED",
+                        headerBytes.size, System.currentTimeMillis() - start, false, cleanError)
+                }
+                val latency = System.currentTimeMillis() - start
+                quad.fourth.close()
+                Stage1Probe(config.originalHost, true, latency, "XHTTP_OK/$statusCode",
+                    headerBytes.size, latency)
+            }
+            else -> {
+                // WebSocket — existing logic unchanged
+                quad.second.write(buildWebSocketHandshake(config).toByteArray()); quad.second.flush()
+                val headerBytes = readHttpHeader(quad.first, stageTimeoutMs)
+                val headerText  = headerBytes.toString(Charsets.UTF_8)
+                if (!headerText.startsWith("HTTP/1.1 101") && !headerText.startsWith("HTTP/1.0 101")) {
+                    quad.fourth.close()
+                    val cleanError = (headerText.lineSequence().firstOrNull() ?: "No 101").take(100).filter { it.code in 32..126 }.ifBlank { "Binary/Invalid HTTP response" }
+                    return Stage1Probe(config.originalHost, false, -1, "WS_REJECTED",
+                        headerBytes.size, System.currentTimeMillis() - start, false, cleanError)
+                }
+                val pingFrame = byteArrayOf(0x89.toByte(), 0x80.toByte(), 0x11, 0x22, 0x33, 0x44)
+                quad.second.write(pingFrame); quad.second.flush()
+                var extraBytes = 0; val waitUntil = System.currentTimeMillis() + keepAliveMs
+                while (System.currentTimeMillis() < waitUntil) { if (quad.first.available() > 0) extraBytes += quad.first.readNBytes(minOf(quad.first.available(), 1024)).size; delayBlocking(80) }
+                quad.fourth.close()
+                Stage1Probe(config.originalHost, true, System.currentTimeMillis() - start,
+                    if (quad.third.isNotBlank()) "WS_OK/${quad.third}" else "WS_OK",
+                    headerBytes.size + extraBytes, keepAliveMs)
+            }
+        }
     } catch (t: Throwable) { try { socket.close() } catch (_: Throwable) {}; Stage1Probe(config.originalHost, false, -1, "FAILED", 0, 0, false, t.message ?: t::class.java.simpleName) }
+}
+
+private fun buildHttp2Probe(config: ParsedTunnelConfig): ByteArray {
+    val hostHeader = config.host.ifBlank { config.sni.ifBlank { config.originalHost } }
+    val path = config.path.ifBlank { "/" }
+    ScannerLog.scan("xhttp h2 probe: GET $path Host=$hostHeader")
+
+    val frames = mutableListOf<Byte>()
+
+    // HTTP/2 connection preface: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    val preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".toByteArray()
+    frames.addAll(preface.toList())
+
+    // SETTINGS frame (type=0x04, flags=0x00, stream=0, empty payload)
+    frames.addAll(listOf(
+        0x00, 0x00, 0x00,        // Length: 0
+        0x04,                     // Type: SETTINGS
+        0x00,                     // Flags: none
+        0x00, 0x00, 0x00, 0x00   // Stream ID: 0
+    ).map { it.toByte() })
+
+    // HEADERS frame (type=0x01, flags=0x05=END_STREAM+END_HEADERS, stream=1)
+    // Minimal headers: :method, :path, :scheme, :authority
+    val headers = buildHttp2Headers(path, hostHeader)
+    val headerLength = headers.size
+
+    frames.addAll(listOf(
+        ((headerLength shr 16) and 0xFF),
+        ((headerLength shr 8) and 0xFF),
+        (headerLength and 0xFF),
+        0x01,                     // Type: HEADERS
+        0x05,                     // Flags: END_STREAM | END_HEADERS
+        0x00, 0x00, 0x00, 0x01   // Stream ID: 1
+    ).map { it.toByte() })
+
+    frames.addAll(headers)
+
+    return frames.toByteArray()
+}
+
+private fun buildHttp2Headers(path: String, authority: String): List<Byte> {
+    // HPACK-encoded headers (literal with indexing)
+    // :method: GET, :path: {path}, :scheme: https, :authority: {authority}
+    val encoded = mutableListOf<Byte>()
+
+    // :method: GET (indexed, index 2)
+    encoded.add(0x82.toByte())
+
+    // :path: {path} (literal with incremental indexing, index 4)
+    encoded.add(0x44.toByte())
+    encoded.add(path.length.toByte())
+    encoded.addAll(path.toByteArray().toList())
+
+    // :scheme: https (indexed, index 7)
+    encoded.add(0x87.toByte())
+
+    // :authority: {authority} (literal with incremental indexing, index 1)
+    encoded.add(0x41.toByte())
+    encoded.add(authority.length.toByte())
+    encoded.addAll(authority.toByteArray().toList())
+
+    return encoded
+}
+
+private fun buildXhttpProbe(config: ParsedTunnelConfig): String {
+    val hostHeader = config.host.ifBlank { config.sni.ifBlank { config.originalHost } }
+    val path = config.path.ifBlank { "/" }
+    val request = buildString {
+        append("GET $path HTTP/1.1\r\n")
+        append("Host: $hostHeader\r\n")
+        append("User-Agent: Mozilla/5.0\r\n")
+        append("Connection: keep-alive\r\n")
+        append("Accept: */*\r\n\r\n")
+    }
+    ScannerLog.scan("xhttp probe request: GET $path Host=$hostHeader")
+    return request
 }
 
 private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
@@ -2095,9 +2707,13 @@ private fun buildWebSocketHandshake(config: ParsedTunnelConfig): String {
     }
 }
 
-private fun buildUri(base: ParsedTunnelConfig, candidateIp: String, status: String): String {
+private fun buildUri(base: ParsedTunnelConfig, candidateIp: String, status: String, resolvedIp: String = ""): String {
     val security = if (base.tls) "tls" else "none"
     val hostValue = base.host
+
+    // For Domain Fronting: use resolved IP as @address (bypasses DNS), keep domain as SNI
+    val addressField = resolvedIp.ifBlank { candidateIp }
+
     val query = buildList {
         add("encryption=none")
         if (base.protocol.equals("vless", true) && base.flow.isNotBlank()) add("flow=${urlEnc(base.flow)}")
@@ -2110,7 +2726,7 @@ private fun buildUri(base: ParsedTunnelConfig, candidateIp: String, status: Stri
         if (base.alpn.isNotBlank()) add("alpn=${urlEnc(base.alpn)}")
         add("allowInsecure=${if (base.allowInsecure) 1 else 0}")
     }.joinToString("&")
-    return "${base.protocol.lowercase()}://${base.userId}@${candidateIp}:${base.port}?$query#${urlEnc(status + "-" + candidateIp)}"
+    return "${base.protocol.lowercase()}://${base.userId}@${addressField}:${base.port}?$query#${urlEnc(status + "-" + candidateIp)}"
 }
 
 private fun urlEnc(value: String): String = URLEncoder.encode(value, "UTF-8")
