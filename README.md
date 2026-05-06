@@ -4,7 +4,7 @@
 ![Kotlin Badge](https://img.shields.io/badge/Language-Kotlin-purple?style=flat-square&logo=kotlin)
 
 
-# 🚀 Advanced L7 Cloudflare Scanner & Analyzer (Android)
+# 🚀 Advanced L7 CDN Domain fronting Scanner & Analyzer (Android)
 ### آنالیزور و اسکنر پیشرفته لایه ۷ کلودفلر (نسخه اندروید)
 
 ## ✨ Major changes (New in v1.6.0)
