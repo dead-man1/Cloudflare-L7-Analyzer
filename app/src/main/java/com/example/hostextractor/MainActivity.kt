@@ -65,7 +65,7 @@ import javax.net.ssl.SSLParameters
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import androidx.compose.material3.NavigationBarItemDefaults
-private const val APP_VERSION = "v1.6.0"
+private const val APP_VERSION = "v1.6.1"
 
 enum class ScannerCore { CLOUDFLARE, CLOUDFRONT, DOMAIN_FRONTING }
 enum class ResultTier { VERIFIED, STRONG, GOOD, BORDERLINE, FAILED }
@@ -679,6 +679,7 @@ data class FinalValidation(
 data class DisplayResult(
     val ip: String,
     val builtConfig: String,
+    val builtConfigDomain: String = "",  // Domain-based config (for Domain Fronting dual output)
     val stage1LatencyMs: Long,
     val finalLatencyMs: Long,
     val aliveMs: Long,
@@ -1478,8 +1479,10 @@ fun ConfigScannerTab(core: ScannerCore, settings: SettingsManager, input: String
 
             Button(
                 onClick = {
-                    clipboard.setText(AnnotatedString(results.joinToString("\n") { it.builtConfig }))
-                    Toast.makeText(context, "Copied all rebuilt configs", Toast.LENGTH_SHORT).show()
+                    val allConfigs = results.joinToString("\n\n") { formatDualConfigs(it) }
+                    val totalCount = results.size + results.count { it.builtConfigDomain.isNotBlank() }
+                    clipboard.setText(AnnotatedString(allConfigs))
+                    Toast.makeText(context, "Copied $totalCount config(s) from ${results.size} result(s)", Toast.LENGTH_SHORT).show()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
                 modifier = Modifier.weight(1f).height(48.dp),
@@ -1642,8 +1645,10 @@ fun IpScannerTab(core: ScannerCore, settings: SettingsManager, input: String, re
 
             Button(
                 onClick = {
-                    clipboard.setText(AnnotatedString(results.joinToString("\n") { it.builtConfig }))
-                    Toast.makeText(context, "Copied verified configs", Toast.LENGTH_SHORT).show()
+                    val allConfigs = results.joinToString("\n\n") { formatDualConfigs(it) }
+                    val totalCount = results.size + results.count { it.builtConfigDomain.isNotBlank() }
+                    clipboard.setText(AnnotatedString(allConfigs))
+                    Toast.makeText(context, "Copied $totalCount config(s) from ${results.size} result(s)", Toast.LENGTH_SHORT).show()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
                 modifier = Modifier.weight(1f).height(48.dp),
@@ -1810,8 +1815,10 @@ fun DomainFrontingScannerTab(
 
             Button(
                 onClick = {
-                    clipboard.setText(AnnotatedString(results.joinToString("\n") { it.builtConfig }))
-                    Toast.makeText(context, "Copied verified configs", Toast.LENGTH_SHORT).show()
+                    val allConfigs = results.joinToString("\n\n") { formatDualConfigs(it) }
+                    val totalCount = results.size + results.count { it.builtConfigDomain.isNotBlank() }
+                    clipboard.setText(AnnotatedString(allConfigs))
+                    Toast.makeText(context, "Copied $totalCount config(s) from ${results.size} result(s)", Toast.LENGTH_SHORT).show()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B5E20)),
                 modifier = Modifier.weight(1f).height(48.dp),
@@ -1893,7 +1900,7 @@ fun ResultRow(result: DisplayResult, core: ScannerCore) {
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Button(
-                    onClick = { openInNetMod(context, result.builtConfig) },
+                    onClick = { openInNetMod(context, result) },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(22.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C3F), contentColor = Color.White)
@@ -1936,9 +1943,11 @@ fun ResultRow(result: DisplayResult, core: ScannerCore) {
                 }
                 Button(
                     onClick = {
+                        val config = formatDualConfigs(result)
+                        val count = if (result.builtConfigDomain.isNotBlank()) 2 else 1
                         val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        cb.setPrimaryClip(ClipData.newPlainText("config", result.builtConfig))
-                        Toast.makeText(context, "Config copied", Toast.LENGTH_SHORT).show()
+                        cb.setPrimaryClip(ClipData.newPlainText("config", config))
+                        Toast.makeText(context, "$count config(s) copied", Toast.LENGTH_SHORT).show()
                     },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(22.dp),
@@ -2041,15 +2050,21 @@ suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: P
 
     if (top100.isEmpty()) {
         return@coroutineScope fastResults.take(20).map {
+            val ipConfig = buildUri(
+                if (core == ScannerCore.DOMAIN_FRONTING) baseConfig.copy(originalHost = it.ip, sni = it.ip, port = it.bestPort)
+                else baseConfig.copy(originalHost = it.ip, port = it.bestPort),
+                it.ip,
+                "FAST_FAILED",
+                it.resolvedIp
+            )
+            val domainConfig = if (core == ScannerCore.DOMAIN_FRONTING && it.resolvedIp.isNotBlank()) {
+                buildUri(baseConfig.copy(originalHost = it.ip, sni = it.ip, port = it.bestPort), it.ip, "FAST_FAILED", "")
+            } else ""
+
             DisplayResult(
                 it.ip,
-                buildUri(
-                    if (core == ScannerCore.DOMAIN_FRONTING) baseConfig.copy(originalHost = it.ip, sni = it.ip, port = it.bestPort)
-                    else baseConfig.copy(originalHost = it.ip, port = it.bestPort),
-                    it.ip,
-                    "FAST_FAILED",
-                    it.resolvedIp  // Pass resolved IP for Domain Fronting
-                ),
+                ipConfig,
+                domainConfig,
                 it.avgLatencyMs,
                 0,
                 0,
@@ -2086,10 +2101,19 @@ suspend fun runThreeStageScan(context: Context, core: ScannerCore, baseConfig: P
                     else -> "FAILED"
                 }
                 synchronized(finals) {
+                    // Generate IP-based config (current behavior)
+                    val ipBasedConfig = buildUri(validationBase, probe.ip, status, probe.resolvedIp)
+
+                    // Generate domain-based config for Domain Fronting (address=domain instead of IP)
+                    val domainBasedConfig = if (core == ScannerCore.DOMAIN_FRONTING && probe.resolvedIp.isNotBlank()) {
+                        buildUri(validationBase, probe.ip, status, "")  // resolvedIp="" means use domain as address
+                    } else ""
+
                     finals.add(
                         DisplayResult(
                             probe.ip,
-                            buildUri(validationBase, probe.ip, status, probe.resolvedIp),
+                            ipBasedConfig,
+                            domainBasedConfig,
                             probe.avgLatencyMs,
                             validation.latencyMs,
                             validation.aliveMs,
@@ -2365,20 +2389,54 @@ private fun isProbablyIp(value: String): Boolean = Regex("""^(\d{1,3}\.){3}\d{1,
 
 private fun extractDomainCandidates(raw: String): List<String> {
     val domainRegex = Regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
-    return raw.lineSequence()
-        .map { line ->
-            // Support CSV format: "domain.com | A_RECORD | IP" → extract first part
-            val cleaned = line.trim().lowercase()
-            if (cleaned.contains('|')) {
-                cleaned.substringBefore('|').trim()
-            } else {
-                cleaned
-            }
+
+    // Smart extraction patterns for verbose input formats
+    val targetDomainPattern = Regex("""(?:Target\s+)?Domain\s*:\s*([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)""", RegexOption.IGNORE_CASE)
+    val resolvedIpPattern = Regex("""Resolved\s+IPs?\s*:\s*([\d.]+)""", RegexOption.IGNORE_CASE)
+
+    val extracted = mutableListOf<String>()
+
+    // Try smart extraction first (handle verbose formats)
+    raw.lineSequence().forEach { line ->
+        val trimmed = line.trim()
+
+        // Skip separator lines, empty lines, comments
+        if (trimmed.isBlank() || trimmed.startsWith("#") || trimmed.startsWith("---") ||
+            trimmed.contains("Failed to resolve", ignoreCase = true) ||
+            trimmed.contains("Curl Status:", ignoreCase = true)) {
+            return@forEach
         }
-        .filter { it.isNotBlank() && !it.startsWith("#") }
-        .filter { it.contains('.') && !isProbablyIp(it) }
+
+        // Extract from "Target Domain: example.com" or "Domain: example.com"
+        targetDomainPattern.find(trimmed)?.let { match ->
+            extracted.add(match.groupValues[1].lowercase())
+            return@forEach
+        }
+
+        // Extract from "Resolved IPs: 1.2.3.4" (optional, keep for IP scanning)
+        resolvedIpPattern.find(trimmed)?.let { match ->
+            val ip = match.groupValues[1]
+            if (!isProbablyIp(ip)) return@let
+            // Store IP if valid (will be filtered out in domain validation, but kept for IP mode)
+            return@forEach
+        }
+
+        // Fallback: CSV format "domain.com | A_RECORD | IP" → extract first part
+        val cleaned = if (trimmed.contains('|')) {
+            trimmed.substringBefore('|').trim().lowercase()
+        } else {
+            trimmed.lowercase()
+        }
+
+        // Add if looks like domain (has dot, not IP)
+        if (cleaned.isNotBlank() && cleaned.contains('.') && !isProbablyIp(cleaned)) {
+            extracted.add(cleaned)
+        }
+    }
+
+    // Strict validation: filter to valid domains only
+    return extracted
         .filter { domain ->
-            // Strict validation: valid domain format + length checks
             domain.length in 4..253 &&
             !domain.contains("..") &&
             !domain.startsWith(".") &&
@@ -2489,10 +2547,21 @@ private fun performStage1Probe(config: ParsedTunnelConfig, stageTimeoutMs: Int, 
         val quad = if (config.tls) {
             val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(socket, config.originalHost, config.port, true) as SSLSocket
             val requestedAlpn = config.alpn.split(',').map { it.trim() }.filter { it.isNotEmpty() }
-            ssl.sslParameters = SSLParameters().apply { serverNames = listOf(SNIHostName(config.sni.ifBlank { config.host.ifBlank { config.originalHost } })); if (requestedAlpn.isNotEmpty()) applicationProtocols = requestedAlpn.toTypedArray() }
+
+            // WebSocket requires HTTP/1.1 - filter out h2/h3 from ALPN to prevent negotiation mismatch
+            val isWebSocket = config.transport.equals("ws", ignoreCase = true)
+            val effectiveAlpn = if (isWebSocket) {
+                requestedAlpn.filter { it.lowercase() == "http/1.1" }.also {
+                    if (it.isEmpty() && requestedAlpn.isNotEmpty()) {
+                        ScannerLog.scan("ws ALPN filtered: removed h2/h3 from ${requestedAlpn.joinToString(",")}")
+                    }
+                }
+            } else requestedAlpn
+
+            ssl.sslParameters = SSLParameters().apply { serverNames = listOf(SNIHostName(config.sni.ifBlank { config.host.ifBlank { config.originalHost } })); if (effectiveAlpn.isNotEmpty()) applicationProtocols = effectiveAlpn.toTypedArray() }
             ssl.soTimeout = stageTimeoutMs; ssl.startHandshake()
             val negotiated = try { ssl.applicationProtocol ?: "" } catch (_: Throwable) { "" }
-            if (requestedAlpn.isNotEmpty() && negotiated.isNotEmpty() && !requestedAlpn.contains(negotiated)) { ssl.close(); return Stage1Probe(config.originalHost, false, -1, "ALPN_MISMATCH", 0, 0, true, "Negotiated $negotiated") }
+            if (effectiveAlpn.isNotEmpty() && negotiated.isNotEmpty() && !effectiveAlpn.contains(negotiated)) { ssl.close(); return Stage1Probe(config.originalHost, false, -1, "ALPN_MISMATCH", 0, 0, true, "Negotiated $negotiated") }
             Quad(BufferedInputStream(ssl.inputStream), ssl.outputStream, negotiated, ssl as AutoCloseable)
         } else {
             Quad(BufferedInputStream(socket.getInputStream()), socket.getOutputStream(), "", socket as AutoCloseable)
@@ -2580,7 +2649,15 @@ private fun performStage1Probe(config: ParsedTunnelConfig, stageTimeoutMs: Int, 
                     headerBytes.size, latency)
             }
             else -> {
-                // WebSocket — existing logic unchanged
+                // WebSocket — requires HTTP/1.1, not compatible with HTTP/2 (h2) or HTTP/3 (h3)
+                val negotiatedProto = quad.third.lowercase()
+                if (negotiatedProto.isNotEmpty() && negotiatedProto != "http/1.1") {
+                    quad.fourth.close()
+                    ScannerLog.scan("ws ALPN mismatch: negotiated=$negotiatedProto (WebSocket requires http/1.1)")
+                    return Stage1Probe(config.originalHost, false, -1, "WS_ALPN_MISMATCH",
+                        0, System.currentTimeMillis() - start, false, "WebSocket requires HTTP/1.1, got $negotiatedProto")
+                }
+
                 quad.second.write(buildWebSocketHandshake(config).toByteArray()); quad.second.flush()
                 val headerBytes = readHttpHeader(quad.first, stageTimeoutMs)
                 val headerText  = headerBytes.toString(Charsets.UTF_8)
@@ -2730,26 +2807,45 @@ private fun buildUri(base: ParsedTunnelConfig, candidateIp: String, status: Stri
 }
 
 private fun urlEnc(value: String): String = URLEncoder.encode(value, "UTF-8")
-private fun openInNetMod(context: Context, config: String) {
+private fun formatDualConfigs(result: DisplayResult): String {
+    return if (result.builtConfigDomain.isNotBlank()) {
+        buildString {
+            appendLine("# IP-based (recommended, no DNS setup needed)")
+            appendLine(result.builtConfig)
+            appendLine()
+            appendLine("# Domain-based (requires custom DNS on phone)")
+            append(result.builtConfigDomain)
+        }
+    } else {
+        result.builtConfig
+    }
+}
+
+private fun openInNetMod(context: Context, result: DisplayResult) {
+    val config = formatDualConfigs(result)
     val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     cb.setPrimaryClip(ClipData.newPlainText("config", config))
+
+    val count = if (result.builtConfigDomain.isNotBlank()) 2 else 1
+    val message = if (count == 2) "2 configs copied • Opening NetMod" else "Config copied • Opening NetMod"
+
     try {
         val launchIntent = context.packageManager.getLaunchIntentForPackage("com.netmod.syna")
         if (launchIntent != null) {
             launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(launchIntent)
-            Toast.makeText(context, "Config copied • Opening NetMod", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
             return
         }
         context.startActivity(
-            Intent(Intent.ACTION_VIEW, Uri.parse(config)).apply {
+            Intent(Intent.ACTION_VIEW, Uri.parse(result.builtConfig)).apply {
                 setPackage("com.netmod.syna")
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         )
-        Toast.makeText(context, "Config copied • Opening NetMod", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
     } catch (_: Throwable) {
-        Toast.makeText(context, "Config copied • NetMod not installed", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "$count config(s) copied • NetMod not installed", Toast.LENGTH_SHORT).show()
     }
 }
 private fun delayBlocking(ms: Long) { try { Thread.sleep(ms) } catch (_: InterruptedException) {} }
