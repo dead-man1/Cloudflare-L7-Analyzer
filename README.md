@@ -5,7 +5,13 @@
 
 
 # 🚀 Advanced L7 CDN Domain fronting Scanner & Analyzer (Android)
-### آنالیزور و اسکنر پیشرفته لایه ۷ کلودفلر (نسخه اندروید)
+### آنالیزور و اسکنر پیشرفته لایه ۷ (نسخه اندروید)
+## 🐛  Minor changes (New in v1.6.1)
+  - WebSocket ALPN mismatch resolved (works with alpn=h2,http/1.1 now)
+
+New Features:
+  1. Smart input parser (extracts domains from verbose formats)
+  2. Dual config generation (IP + domain configs for Domain Fronting)
 
 ## ✨ Major changes (New in v1.6.0)
 
